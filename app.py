@@ -12,7 +12,7 @@ import io
 import random
 
 # Must be the first Streamlit command
-st.set_page_config(page_title="Chatbot", layout="wide")
+st.set_page_config(page_title="Vakeel Saab AI - Legal Assistant", layout="wide")
 
 # Configure logging
 logging.basicConfig(
@@ -268,7 +268,7 @@ def is_valid_file_type(file):
 # Identity management function
 def is_identity_question(query: str) -> bool:
     """
-    Check if the query is asking about the bot's identity/creator.
+    Check if the query is asking about the legal assistant's identity/creator.
     Returns True if it's an identity question, False otherwise.
     """
     # Convert to lowercase for case-insensitive matching
@@ -276,6 +276,7 @@ def is_identity_question(query: str) -> bool:
     
     # Keywords related to identity questions
     identity_keywords = [
+        # General identity questions
         "who built you", "who made you", "who created you", 
         "who developed you", "who programmed you", "who designed you",
         "who owns you", "who are you made by", "who's your creator",
@@ -286,7 +287,18 @@ def is_identity_question(query: str) -> bool:
         "who created this bot", "who built this bot", "who made this chatbot",
         "openai", "meta", "google", "microsoft", "anthropic", "claude",
         "moksha", "moksha solutions", "what is moksha", "what's moksha",
-        "are you a real bot", "are you an ai"
+        "are you a real bot", "are you an ai",
+        
+        # Legal assistant specific questions
+        "who is vakeel saab", "what is vakeel saab", "who's vakeel saab",
+        "what does vakeel saab mean", "why are you called vakeel saab",
+        "what firm are you from", "which law firm", "which legal company",
+        "what's your legal background", "what is your legal background",
+        "what's your legal training", "what is your legal training",
+        "how were you trained", "what legal data", "what legal documents",
+        "where did you learn law", "how did you learn law",
+        "are you a real lawyer", "are you a real advocate", "are you a real vakeel",
+        "inlegalbert", "legal bert", "legal model", "legal embedding"
     ]
     
     # Check if any of the keywords are in the query
@@ -296,28 +308,26 @@ def is_identity_question(query: str) -> bool:
     
     return False
 
-# Friendly identity responses
+# Legal assistant identity responses
 def get_identity_response() -> str:
     """
-    Returns a randomly selected friendly response about the bot's identity.
+    Returns a randomly selected professional response about the legal assistant's identity.
     """
-    friendly_responses = [
-        "Oh, I was built by the AI development team at Moksha Solutions! They're working on making document understanding smarter and more helpful for students with their studies and school work.",
+    legal_responses = [
+        "I am Vakeel Saab AI, developed by the AI development team at Moksha Solutions. I'm specialized in Indian legal research and document analysis to assist lawyers and legal professionals with their case work.",
         
-        "The AI development team at Moksha Solutions is behind me. They've been experimenting with AI to build useful bots to help students learn more effectively. Pretty cool, right?",
+        "I'm a legal AI assistant built by Moksha Solutions, trained specifically on Indian legal documents and case law to help legal professionals with research and document analysis.",
         
-        "That would be the AI development team at Moksha Solutions — the brains behind this chatbot! They're on a mission to make studying and research easier for students.",
+        "Moksha Solutions' AI team created me to assist the Indian legal community. I'm trained on a corpus of 5.4 million Indian legal documents from the Supreme Court and various High Courts, spanning from 1950 to 2019.",
         
-        "I'm a project from Moksha Solutions. Their AI team designed me to help students chat with documents and get quick answers to support their studies without all the reading. How can I help you today?",
+        "I'm Vakeel Saab AI, an Indian legal assistant developed by Moksha Solutions. I use language models and specialized legal embeddings to help with case research, document analysis, and legal information retrieval.",
         
-        "Moksha Solutions' AI team created me for educational purposes. I'm here to make studying and learning more intuitive and helpful for students!",
+        "I was developed by Moksha Solutions, specifically designed to assist legal professionals in India. My knowledge covers various legal domains including Civil, Criminal, Constitutional, and other areas of Indian law.",
         
-        "I'm one of Moksha Solutions' projects! Their AI development team built me to help students access and understand information more easily for their schoolwork.",
-        
-        "Yep, I'm a chatbot developed by the AI development team at Moksha Solutions. I specialize in helping students understand documents better and faster for their studies. What can I help you with?"
+        "I'm a specialized legal AI assistant created by Moksha Solutions for the Indian legal community. I'm designed to process legal documents, extract relevant information, and provide insights based on Indian law and precedents."
     ]
     
-    return random.choice(friendly_responses)
+    return random.choice(legal_responses)
 
 # Add file processing function
 def process_file(file):
@@ -545,9 +555,9 @@ if uploaded_file and not current_chat["document_processed"]:
         st.rerun()
 
 # Main chat interface
-st.markdown("<h1 style='text-align: center;'>PaperTrail AI</h1>", unsafe_allow_html=True)
-st.markdown("<p style='color: #808080; text-align: center; margin-bottom: 15px; font-size: 18px;'>What can I help with? Upload a document and chat with it</p>", unsafe_allow_html=True)
-# update the title to be more descriptive
+st.markdown("<h1 style='text-align: center;'>Vakeel Saab AI</h1>", unsafe_allow_html=True)
+st.markdown("<p style='color: #808080; text-align: center; margin-bottom: 15px; font-size: 18px;'>Your AI Legal Assistant for Indian Law</p>", unsafe_allow_html=True)
+st.markdown("<p style='color: #808080; text-align: center; margin-bottom: 25px; font-size: 16px;'>Upload legal documents and ask questions about Indian law, cases, and legal procedures</p>", unsafe_allow_html=True)
 
 # Display document info if loaded
 if current_chat["document_processed"]:
@@ -636,7 +646,22 @@ def process_query(query):
                         if "direct_chat_engine" not in current_chat or current_chat["direct_chat_engine"] is None:
                             # Create and store a chat engine for this session
                             temp_engine = RAGEngine(config=rag_config).initialize()
+                            
+                            # Transfer the conversation history to the new engine's memory
+                            for msg in current_chat["messages"]:
+                                if msg["role"] == "user":
+                                    user_msg = msg["content"]
+                                    # Find corresponding assistant message (if any)
+                                    ai_response = next((m["content"] for m in current_chat["messages"] 
+                                                      if m["role"] == "assistant" and 
+                                                      current_chat["messages"].index(m) > current_chat["messages"].index(msg)), 
+                                                     None)
+                                    if ai_response:
+                                        temp_engine.memory.save_context({"question": user_msg}, {"answer": ai_response})
+                            
+                            # Setup the direct chain
                             temp_engine.setup_direct_chain(groq_api_key)
+                            
                             set_current_chat("direct_chat_engine", temp_engine)
                             
                         # Get the chat engine and query

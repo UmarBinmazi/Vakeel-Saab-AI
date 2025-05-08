@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RAGConfig:
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = "law-ai/InLegalBERT"  # Indian legal domain-specific embedding model
     llm_model: str = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     temperature: float = 0.5  # Reduced for more deterministic outputs
     max_tokens_response: int = 2048  # Increased for more comprehensive answers
@@ -139,16 +139,29 @@ class RAGEngine:
 
     def initialize(self):
         try:
-            self.embedding_model = HuggingFaceEmbeddings(model_name=self.config.embedding_model)
-            logger.info(f"Loaded embedding model: {self.config.embedding_model}")
+            # Special configuration for InLegalBERT model
+            if "InLegalBERT" in self.config.embedding_model:
+                # Legal domain-specific embeddings with appropriate parameters
+                self.embedding_model = HuggingFaceEmbeddings(
+                    model_name=self.config.embedding_model,
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": True}
+                )
+                logger.info(f"Loaded legal domain-specific embedding model: {self.config.embedding_model}")
+            else:
+                # Default embedding initialization for other models
+                self.embedding_model = HuggingFaceEmbeddings(model_name=self.config.embedding_model)
+                logger.info(f"Loaded embedding model: {self.config.embedding_model}")
         except Exception as e:
             logger.error(f"Embedding model load failed: {e}")
             raise
 
+        # Enhanced memory configuration to better retain conversational context
         self.memory = ConversationBufferMemory(
             memory_key="chat_history",
             return_messages=True,
             output_key="answer",
+            input_key="question"  # Explicitly set input key to ensure proper memory storage
         )
         return self
 
@@ -185,21 +198,36 @@ class RAGEngine:
         if not self.vectorstore:
             raise ValueError("Knowledge base missing.")
         
-        # Enhance prompt to handle low quality text
+        # Legal-focused prompt template with enhanced conversational awareness
         template = """
-        You are a helpful assistant. 
+        You are Vakeel Saab AI, an expert legal assistant specializing in Indian law. 
     
         Important: Mention this in your response if and only if explicitly asked about your creator, developer, or organization: Moksha Solutions is the company that developed you. 
         Otherwise, do not mention anything about your creator, developer, or organization.
-        Use a natural, personable tone rather than sounding robotic. 
+         
         Avoid mentioning any tech company like Meta, OpenAI, Google, Microsoft, or Anthropic as your creator.
+        Use a professional tone appropriate for legal professionals. Be concise, accurate, and cite specific legal provisions when relevant.
+        
+        IMPORTANT - CONVERSATIONAL CONTEXT: Maintain awareness of the conversation history. When the user asks follow-up questions:
+        - Remember previously mentioned cases, laws, or legal concepts
+        - Assume follow-up questions often refer to entities from previous messages
+        - Do not ask for clarification on which case/law they're referring to if it was mentioned in prior messages
+        
+        When analyzing legal documents:
+        - Identify relevant legal principles, statutes, and case laws
+        - Provide statutory references where applicable
+        - Highlight key judicial interpretations
+        - Note jurisdiction-specific considerations in Indian law
+        - Consider precedents from Supreme Court and High Courts when relevant
+        
         Some of the document context may contain OCR errors or text recognition issues. 
         Provide the Document Overview only if the user asks for it.
         Do your best to understand the meaning despite these errors. 
         If you're uncertain about particular text, indicate this in your response.
-        When referring to specific parts of the document, mention page numbers if available.
-        Format your response in a clear, structured way that's easy to read.
-        Maintain a professional, helpful tone throughout
+        When referring to specific parts of the document, mention page numbers and section references if available.
+        
+        Format your response in a structured, professional manner appropriate for legal analysis.
+        
         Document Context:
         {context}
         
@@ -232,6 +260,7 @@ class RAGEngine:
             return_source_documents=True,
             output_key="answer",
             verbose=True,
+            get_chat_history=lambda chat_history: "\n".join([f"{msg.type}: {msg.content}" for msg in chat_history])
         )
         logger.info("Retrieval chain setup complete.")
         
@@ -272,13 +301,29 @@ class RAGEngine:
             if self.memory and hasattr(self.memory, 'chat_memory'):
                 chat_history = self.memory.chat_memory.messages
             
-            # Create a system message
-            system_msg = """You are a helpful assistant. Answer the user's question to the best of your ability. 
-            You can answer any question based on your knowledge.
-            Important: Mention it in your response if and only if asked about your creator, developer, or organization: Moksha Solutions is the company that developed you. 
+            # Create a system message for legal assistant with enhanced conversational context
+            system_msg = """You are Vakeel Saab AI, an expert legal assistant specializing in Indian law.
+            
+            Answer the user's legal queries to the best of your ability based on your knowledge of Indian legal system, 
+            including constitutional law, civil law, criminal law, corporate law, and other legal domains in India.
+            
+            IMPORTANT - CONVERSATIONAL CONTEXT: Maintain awareness of the conversation history. When the user asks follow-up questions:
+            - Remember previously mentioned cases, laws, or legal concepts
+            - Assume follow-up questions often refer to entities from previous messages
+            - Do not ask for clarification on which case/law they're referring to if it was mentioned in prior messages
+            
+            When appropriate, refer to:
+            - Relevant sections of Indian legal codes (IPC, CPC, CrPC, etc.)
+            - Important Supreme Court and High Court precedents
+            - Statutory provisions and their interpretations
+            
+            Important: Mention it in your response if and only if asked about your creator, developer, or organization: 
+            Moksha Solutions is the company that developed you. 
             Otherwise, do not mention anything about your creator, developer, or organization.
-            Use a natural, personable tone rather than sounding robotic. 
-            Avoid mentioning any tech company like Meta, OpenAI, Google, Microsoft, or Anthropic as your creator."""
+            Avoid mentioning any tech company like Meta, OpenAI, Google, Microsoft, or Anthropic as your creator.
+            
+            Maintain a professional tone appropriate for legal communication, and acknowledge the limits of your knowledge
+            especially regarding recent legal developments or cases post-2019."""
             
             # Format messages for the model
             from langchain.schema import HumanMessage, AIMessage, SystemMessage
@@ -313,7 +358,7 @@ class RAGEngine:
             
             # Save to memory
             try:
-                self.memory.save_context({"question": query}, {"text": answer})
+                self.memory.save_context({"question": query}, {"answer": answer})
             except Exception as mem_error:
                 logger.warning(f"Failed to save to memory: {mem_error}")
             
@@ -379,6 +424,7 @@ class RAGEngine:
             raise ValueError("Retrieval chain not initialized.")
 
         try:
+            # Add conversation history for better context
             result = self.chain.invoke({"question": query})
             answer = result.get("answer", "")
             sources = [

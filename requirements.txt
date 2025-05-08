@@ -25,6 +25,10 @@ sentence-transformers>=2.2.2
 faiss-cpu>=1.7.4
 tiktoken>=0.5.1
 
+# Legal specific models
+# InLegalBERT requires specific versions of Hugging Face libraries
+huggingface-hub>=0.19.4
+
 # Utility
 numpy>=1.24.0
 tqdm>=4.66.1
