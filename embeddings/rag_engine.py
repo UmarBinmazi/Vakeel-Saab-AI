@@ -1,12 +1,13 @@
 import logging
 import re
+import os
 from typing import List, Dict, Tuple, Optional, Any
 
 from dataclasses import dataclass, field
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
-from langchain.chains import ConversationalRetrievalChain
+from langchain.chains import ConversationalRetrievalChain, RetrievalQA
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
 from langchain.schema import BaseRetriever, Document
@@ -15,6 +16,9 @@ from langchain.callbacks.manager import CallbackManagerForRetrieverRun
 from core.utils import (
     num_tokens_from_string,
     smart_chunk_selection,
+    get_document_hash,
+    get_index_path,
+    index_exists
 )
 from core.ocr import is_gibberish, StatisticalTextCorrector
 
@@ -252,18 +256,38 @@ class RAGEngine:
         )
 
         retriever = self._create_retriever()
-        self.chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=retriever,
-            memory=self.memory,
-            combine_docs_chain_kwargs={"prompt": prompt},
-            return_source_documents=True,
-            output_key="answer",
-            verbose=True,
-            get_chat_history=lambda chat_history: "\n".join([f"{msg.type}: {msg.content}" for msg in chat_history])
-        )
-        logger.info("Retrieval chain setup complete.")
         
+        # Try to create the ConversationalRetrievalChain with error handling
+        try:
+            self.chain = ConversationalRetrievalChain.from_llm(
+                llm=llm,
+                retriever=retriever,
+                memory=self.memory,
+                combine_docs_chain_kwargs={"prompt": prompt},
+                return_source_documents=True,
+                output_key="answer",
+                verbose=True,
+                get_chat_history=lambda chat_history: "\n".join([f"{msg.type}: {msg.content}" for msg in chat_history])
+            )
+            logger.info("Retrieval chain setup complete.")
+        except Exception as e:
+            logger.error(f"Error in ConversationalRetrievalChain creation: {e}")
+            # Fallback to simpler RetrievalQA chain which is more serialization-friendly
+            from langchain.chains import RetrievalQA
+            
+            # Create a simpler memory-free chain as fallback
+            self.chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=retriever,
+                return_source_documents=True,
+                chain_type_kwargs={"prompt": prompt},
+            )
+            logger.info("Fallback RetrievalQA chain setup complete - conversation history may not be fully utilized")
+            
+            # Since we're using a non-conversational chain, we'll need to handle memory manually
+            # by including chat history in our prompts
+
     def setup_direct_chain(self, groq_api_key: str):
         """
         Set up a direct LLM chain without requiring a knowledge base.
@@ -424,13 +448,44 @@ class RAGEngine:
             raise ValueError("Retrieval chain not initialized.")
 
         try:
-            # Add conversation history for better context
-            result = self.chain.invoke({"question": query})
-            answer = result.get("answer", "")
-            sources = [
-                {"content": doc.page_content, "metadata": doc.metadata}
-                for doc in result.get("source_documents", [])
-            ]
+            # Check if we're using the fallback RetrievalQA chain (doesn't accept chat_history)
+            if isinstance(self.chain, RetrievalQA):
+                # For RetrievalQA, manually add chat history to the query if available
+                if self.memory and hasattr(self.memory, 'chat_memory') and self.memory.chat_memory.messages:
+                    # Format recent chat history (last 3 exchanges)
+                    recent_messages = self.memory.chat_memory.messages[-6:] if len(self.memory.chat_memory.messages) > 6 else self.memory.chat_memory.messages
+                    history_text = "\n".join([f"{'Human' if msg.type == 'human' else 'Assistant'}: {msg.content}" for msg in recent_messages])
+                    
+                    # Add chat history to query for context
+                    augmented_query = f"Given the following conversation history:\n{history_text}\n\nCurrent question: {query}"
+                    
+                    # Use the augmented query
+                    result = self.chain.invoke({"query": augmented_query})
+                else:
+                    # No history, use query directly
+                    result = self.chain.invoke({"query": query})
+                
+                # Extract answer and sources from RetrievalQA result
+                answer = result.get("result", "")
+                sources = [
+                    {"content": doc.page_content, "metadata": doc.metadata}
+                    for doc in result.get("source_documents", [])
+                ]
+                
+                # Save to memory manually
+                if self.memory:
+                    try:
+                        self.memory.save_context({"question": query}, {"answer": answer})
+                    except Exception as mem_error:
+                        logger.warning(f"Failed to save to memory: {mem_error}")
+            else:
+                # For ConversationalRetrievalChain with built-in memory handling
+                result = self.chain.invoke({"question": query})
+                answer = result.get("answer", "")
+                sources = [
+                    {"content": doc.page_content, "metadata": doc.metadata}
+                    for doc in result.get("source_documents", [])
+                ]
             
             # Add a note about potential OCR issues if low confidence sources were used
             low_confidence_sources = [s for s in sources if s["metadata"].get("confidence", 1.0) < 0.7]
@@ -444,3 +499,52 @@ class RAGEngine:
         except Exception as e:
             logger.error(f"Query error: {e}")
             return f"I encountered an error: {e}", []
+
+    def save_knowledge_base(self, index_name: str):
+        if not self.vectorstore:
+            raise ValueError("Knowledge base missing.")
+        
+        index_path = get_index_path(index_name)
+        try:
+            self.vectorstore.save_local(index_path)
+            logger.info(f"Knowledge base saved to {index_path}")
+        except Exception as e:
+            logger.error(f"Failed to save knowledge base: {e}")
+            raise
+
+    def load_knowledge_base(self, index_name: str):
+        index_path = get_index_path(index_name)
+        if not os.path.exists(index_path):
+            logger.info(f"Knowledge base does not exist at {index_path}")
+            return False
+        
+        try:
+            # Allow deserialization since we're loading our own saved indices
+            self.vectorstore = FAISS.load_local(
+                index_path, 
+                self.embedding_model,
+                allow_dangerous_deserialization=True  # Required for loading pickle files
+            )
+            logger.info(f"Knowledge base loaded from {index_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load knowledge base: {e}")
+            raise
+
+    def __del__(self):
+        """Clean up resources when the object is destroyed."""
+        try:
+            # Clean up any resources that might cause serialization issues
+            if hasattr(self, 'embedding_model') and self.embedding_model is not None:
+                # Close any open resources in the embedding model
+                if hasattr(self.embedding_model, 'client'):
+                    self.embedding_model.client = None
+                
+                # Release any tensor resources
+                import gc
+                gc.collect()
+                
+                logger.info("RAGEngine resources cleaned up.")
+        except Exception as e:
+            logger.warning(f"Error during RAGEngine cleanup: {e}")
+            pass

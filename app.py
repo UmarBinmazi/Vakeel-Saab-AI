@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import time
 import uuid
+import shutil
 from docx import Document
 from PIL import Image
 import pytesseract
@@ -22,7 +23,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Import core modules
-from core.utils import setup_api_keys, get_env_variable
+from core.utils import (
+    setup_api_keys, 
+    get_env_variable, 
+    get_document_hash, 
+    index_exists
+)
 from core.pdf_parser import PDFParser
 from core.chunking import DocumentChunker
 from embeddings.rag_engine import RAGEngine, RAGConfig
@@ -245,18 +251,43 @@ with st.sidebar:
             help="Number of document chunks to retrieve per query"
         )
         rag_config.retrieval_k = retrieval_k
+        
+        # Index management
+        st.markdown("### Persistent Storage")
+        
+        # Add info about index storage
+        indices_dir = os.path.join(os.getcwd(), "storage", "indices")
+        if os.path.exists(indices_dir):
+            index_files = [f for f in os.listdir(indices_dir) if os.path.isdir(os.path.join(indices_dir, f))]
+            if index_files:
+                st.info(f"Found {len(index_files)} saved document indices. These will be used for faster document loading when the same document is uploaded again.")
+                
+                # Option to clear indices
+                if st.button("Clear All Saved Indices"):
+                    try:
+                        for index_file in index_files:
+                            index_path = os.path.join(indices_dir, index_file)
+                            shutil.rmtree(index_path)
+                        st.success("All indices cleared successfully!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error clearing indices: {e}")
+            else:
+                st.info("No saved document indices found. Processed documents will be saved for faster loading in the future.")
+        else:
+            st.info("Persistent storage will be created when you process your first document.")
 
-    # API key status
-    # st.markdown("### API Status")
-    # if api_keys["huggingface_key"]:
-    #     st.success("HuggingFace API key loaded")
-    # else:
-    #     st.warning("HuggingFace API key not found")
-    #         
-    # if api_keys["groq_key"]:
-    #     st.success("Groq API key loaded")
-    # else:
-    #     st.error("Groq API key missing")
+    #API key status
+    st.markdown("### API Status")
+    if api_keys["huggingface_key"]:
+        st.success("HuggingFace API key loaded")
+    else:
+        st.warning("HuggingFace API key not found")
+            
+    if api_keys["groq_key"]:
+        st.success("Groq API key loaded")
+    else:
+        st.error("Groq API key missing")
 
 # Add file type validation function
 def is_valid_file_type(file):
@@ -394,6 +425,9 @@ def process_document(file):
         # Get file bytes
         file_bytes = file.getvalue()
         
+        # Generate document hash for persistence
+        doc_hash = get_document_hash(file_bytes, file.name)
+        
         # Add file size info
         file_size_mb = len(file_bytes) / (1024 * 1024)
         if file_size_mb > 10:
@@ -402,6 +436,107 @@ def process_document(file):
         with st.status("Processing document...", expanded=True) as status:
             # Initialize progress bar
             progress_bar = st.progress(0)
+            status.update(label="Checking for existing document index...", state="running")
+            progress_bar.progress(5)
+            
+            # Initialize RAG engine
+            rag_engine = RAGEngine(config=rag_config).initialize()
+            
+            # Try to load existing index for this document
+            if rag_engine.load_knowledge_base(doc_hash):
+                # Successfully loaded existing index
+                progress_bar.progress(50)
+                status.update(label="Using previously processed document index", state="running")
+                
+                # Setup retrieval chain
+                status.update(label="Setting up AI model...", state="running")
+                progress_bar.progress(90)
+                
+                # Flag to track if we need to create the chain manually
+                chain_initialized = False
+                
+                try:
+                    groq_api_key = get_env_variable("GROQ_API_KEY")
+                    rag_engine.setup_retrieval_chain(groq_api_key)
+                    chain_initialized = True
+                except Exception as e:
+                    # Handle serialization errors more gracefully
+                    if "pickle" in str(e) or "serializ" in str(e).lower():
+                        progress_bar.progress(98)
+                        st.warning(f"Using simplified model due to serialization constraints: {str(e)}")
+                        logger.warning(f"Serialization issue in retrieval chain: {e}")
+                        # The fallback should have happened in the setup_retrieval_chain method
+                        # But let's verify the chain was actually created
+                        chain_initialized = hasattr(rag_engine, 'chain') and rag_engine.chain is not None
+                    else:
+                        progress_bar.empty()
+                        st.error(f"Error setting up retrieval chain: {e}")
+                        return False
+                
+                # Additional verification to ensure chain is initialized
+                if not chain_initialized:
+                    try:
+                        groq_api_key = get_env_variable("GROQ_API_KEY")
+                        # Force creation of a simple RetrievalQA chain as last resort
+                        from langchain.chains import RetrievalQA
+                        from langchain.prompts import PromptTemplate
+                        from langchain_groq import ChatGroq
+                        
+                        # Create a basic prompt
+                        prompt_template = """
+                        Answer the question based on the following context:
+                        
+                        {context}
+                        
+                        Question: {query}
+                        """
+                        prompt = PromptTemplate.from_template(prompt_template)
+                        
+                        # Setup basic components
+                        llm = ChatGroq(
+                            model_name=rag_config.llm_model,
+                            temperature=rag_config.temperature,
+                            groq_api_key=groq_api_key,
+                            max_tokens=rag_config.max_tokens_response,
+                        )
+                        
+                        # Create a simple retriever
+                        retriever = rag_engine.vectorstore.as_retriever(
+                            search_kwargs={"k": rag_config.retrieval_k}
+                        )
+                        
+                        # Create a basic chain
+                        rag_engine.chain = RetrievalQA.from_chain_type(
+                            llm=llm,
+                            chain_type="stuff",
+                            retriever=retriever,
+                            chain_type_kwargs={"prompt": prompt},
+                            return_source_documents=True,
+                        )
+                        
+                        st.warning("Using basic retrieval chain as fallback due to initialization issues")
+                        logger.warning("Created basic fallback chain manually")
+                    except Exception as fallback_error:
+                        progress_bar.empty()
+                        st.error(f"Critical error setting up retrieval chain: {fallback_error}")
+                        return False
+                
+                # Store in current chat session
+                set_current_chat("rag_engine", rag_engine)
+                set_current_chat("document_processed", True)
+                set_current_chat("pdf_name", file.name)
+                
+                # Complete progress
+                progress_bar.progress(100)
+                status.update(label="Document loaded from existing index!", state="complete", expanded=False)
+                
+                # Clean up progress bar after a delay
+                time.sleep(1)
+                progress_bar.empty()
+                
+                return True
+            
+            # Process document from scratch if no existing index
             status.update(label="Analyzing document...", state="running")
             progress_bar.progress(10)
             
@@ -487,23 +622,18 @@ def process_document(file):
                 st.error(f"Error creating chunks: {e}")
                 return False
             
-            # Initialize RAG engine
-            status.update(label="Initializing RAG engine...", state="running")
+            # Create knowledge base
+            status.update(label="Building knowledge base...", state="running")
             progress_bar.progress(80)
             
             try:
-                rag_engine = RAGEngine(config=rag_config).initialize()
-            except Exception as e:
-                progress_bar.empty()
-                st.error(f"Error initializing RAG engine: {e}")
-                return False
-            
-            # Create knowledge base
-            status.update(label="Building knowledge base...", state="running")
-            progress_bar.progress(90)
-            
-            try:
                 rag_engine.create_knowledge_base(chunks)
+                
+                # Save the knowledge base for future use
+                status.update(label="Saving knowledge base for future use...", state="running")
+                progress_bar.progress(85)
+                rag_engine.save_knowledge_base(doc_hash)
+                
             except Exception as e:
                 progress_bar.empty()
                 st.error(f"Error creating knowledge base: {e}")
@@ -513,13 +643,74 @@ def process_document(file):
             status.update(label="Setting up AI model...", state="running")
             progress_bar.progress(95)
             
+            # Flag to track if we need to create the chain manually
+            chain_initialized = False
+            
             try:
                 groq_api_key = get_env_variable("GROQ_API_KEY")
                 rag_engine.setup_retrieval_chain(groq_api_key)
+                chain_initialized = True
             except Exception as e:
-                progress_bar.empty()
-                st.error(f"Error setting up retrieval chain: {e}")
-                return False
+                # Handle serialization errors more gracefully
+                if "pickle" in str(e) or "serializ" in str(e).lower():
+                    progress_bar.progress(98)
+                    st.warning(f"Using simplified model due to serialization constraints: {str(e)}")
+                    logger.warning(f"Serialization issue in retrieval chain: {e}")
+                    # The fallback should have happened in the setup_retrieval_chain method
+                    # But let's verify the chain was actually created
+                    chain_initialized = hasattr(rag_engine, 'chain') and rag_engine.chain is not None
+                else:
+                    progress_bar.empty()
+                    st.error(f"Error setting up retrieval chain: {e}")
+                    return False
+            
+            # Additional verification to ensure chain is initialized
+            if not chain_initialized:
+                try:
+                    groq_api_key = get_env_variable("GROQ_API_KEY")
+                    # Force creation of a simple RetrievalQA chain as last resort
+                    from langchain.chains import RetrievalQA
+                    from langchain.prompts import PromptTemplate
+                    from langchain_groq import ChatGroq
+                    
+                    # Create a basic prompt
+                    prompt_template = """
+                    Answer the question based on the following context:
+                    
+                    {context}
+                    
+                    Question: {query}
+                    """
+                    prompt = PromptTemplate.from_template(prompt_template)
+                    
+                    # Setup basic components
+                    llm = ChatGroq(
+                        model_name=rag_config.llm_model,
+                        temperature=rag_config.temperature,
+                        groq_api_key=groq_api_key,
+                        max_tokens=rag_config.max_tokens_response,
+                    )
+                    
+                    # Create a simple retriever
+                    retriever = rag_engine.vectorstore.as_retriever(
+                        search_kwargs={"k": rag_config.retrieval_k}
+                    )
+                    
+                    # Create a basic chain
+                    rag_engine.chain = RetrievalQA.from_chain_type(
+                        llm=llm,
+                        chain_type="stuff",
+                        retriever=retriever,
+                        chain_type_kwargs={"prompt": prompt},
+                        return_source_documents=True,
+                    )
+                    
+                    st.warning("Using basic retrieval chain as fallback due to initialization issues")
+                    logger.warning("Created basic fallback chain manually")
+                except Exception as fallback_error:
+                    progress_bar.empty()
+                    st.error(f"Critical error setting up retrieval chain: {fallback_error}")
+                    return False
             
             # Store in current chat session
             set_current_chat("rag_engine", rag_engine)

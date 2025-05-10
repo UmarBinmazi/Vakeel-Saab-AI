@@ -3,6 +3,7 @@ import tiktoken
 import numpy as np
 import logging
 from dotenv import load_dotenv
+import hashlib
 
 # Configure logging
 logging.basicConfig(
@@ -148,4 +149,34 @@ def smart_chunk_selection(chunks, query, similarity_scores, max_tokens):
                 selected_chunks.append(partial_chunk)
             break
             
-    return selected_chunks 
+    return selected_chunks
+
+# Add utility functions for FAISS persistence
+def get_storage_dir():
+    """Get the directory for storing persistent data."""
+    # Create storage directory if it doesn't exist
+    storage_dir = os.path.join(os.getcwd(), "storage")
+    indices_dir = os.path.join(storage_dir, "indices")
+    
+    os.makedirs(storage_dir, exist_ok=True)
+    os.makedirs(indices_dir, exist_ok=True)
+    
+    return storage_dir
+
+def get_document_hash(file_content, filename):
+    """Generate a unique hash for a document based on content and name."""
+    # Create a hash of the file content
+    content_hash = hashlib.md5(file_content).hexdigest()
+    # Combine with filename to ensure uniqueness
+    full_hash = hashlib.md5(f"{content_hash}-{filename}".encode()).hexdigest()
+    return full_hash
+
+def get_index_path(doc_hash):
+    """Get the path for storing a FAISS index based on document hash."""
+    indices_dir = os.path.join(get_storage_dir(), "indices")
+    return os.path.join(indices_dir, doc_hash)
+
+def index_exists(doc_hash):
+    """Check if an index exists for the given document hash."""
+    index_path = get_index_path(doc_hash)
+    return os.path.exists(index_path) 
